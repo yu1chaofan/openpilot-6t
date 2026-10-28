@@ -49,6 +49,21 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Fetch source tree
+        run: |
+          set -euo pipefail
+          # 本仓库只承载 workflow；源码运行时从源站拉取固定 commit
+          git clone --depth 1 --branch 3xl https://jihulab.com/mr-one/openpilot.git src
+          cd src
+          SRC_COMMIT="$(git rev-parse HEAD)"
+          echo "SRC_COMMIT=$SRC_COMMIT" >> "$GITHUB_ENV"
+          echo "source commit: $SRC_COMMIT"
+          # 子模块在本仓库被展平为普通目录，源站 clone 后需同步
+          cd "$GITHUB_WORKSPACE"
+          rsync -a --exclude '.git' src/ . || cp -r src/. .
+          rm -rf src
+          ls -la | head -20
+
       - name: Install host tooling
         run: |
           sudo apt-get update -qq
