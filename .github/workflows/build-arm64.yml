@@ -134,7 +134,7 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
           source .venv/bin/activate
-          export PYTHONPATH="$PYTHONPATH:$PWD"
+          export PYTHONPATH="${PYTHONPATH:-}:$PWD"
           export CI=1
           scons -j"${{ inputs.scons_jobs }}" --minimal 2>&1 | tee /tmp/build.log | tail -120
 
@@ -143,7 +143,7 @@ jobs:
         run: |
           set -euo pipefail
           source .venv/bin/activate
-          export PYTHONPATH="$PYTHONPATH:$PWD"
+          export PYTHONPATH="${PYTHONPATH:-}:$PWD"
           echo "=== 产物清单 ==="
           find . -path ./.git -prune -o -path ./.venv -prune -o \
             -type f \( -name '*.so' -o -name '*.a' \) -print | head -40
