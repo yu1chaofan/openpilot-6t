@@ -15,7 +15,7 @@ on:
       ref:
         description: 'dragonpilot 分支/标签'
         required: false
-        default: '0.11.1'
+        default: 'pre-build'
       comma_hardware:
         description: '伪装 comma 硬件 (创建 /TICI, 启用 camerad 与设备专用编译)'
         required: false
@@ -55,7 +55,7 @@ jobs:
       - name: Fetch dragonpilot source
         run: |
           set -euo pipefail
-          REF="${{ inputs.ref || '0.11.1' }}"
+          REF="${{ inputs.ref || 'pre-build' }}"
           echo "target ref: $REF"
           URL="https://github.com/dragonpilot/dragonpilot/archive/refs/heads/${REF}.tar.gz"
 
@@ -109,6 +109,11 @@ jobs:
           # 官方 pre-build 分支保留了全部 ONNX, 直接补齐。
           MDIR="selfdrive/modeld/models"
           mkdir -p "$MDIR"
+          if [ "${SRC_REF:-}" = "pre-build" ]; then
+            echo "source is pre-build: ONNX models and .cc sources already included"
+            ls -la "$MDIR"/*.onnx 2>/dev/null | head -6 || true
+            exit 0
+          fi
           miss=0
           for m in driving_vision.onnx driving_policy.onnx dmonitoring_model.onnx \
                    big_driving_vision.onnx big_driving_policy.onnx; do
@@ -207,7 +212,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dragonpilot-arm64-${{ inputs.ref || '0.11.1' }}
+          name: dragonpilot-arm64-${{ inputs.ref || 'pre-build' }}
           path: dist
           if-no-files-found: warn
           retention-days: 14
