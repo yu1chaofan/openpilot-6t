@@ -1,168 +1,160 @@
 name: build-arm64
 
-# openpilot/sunnypilot 原生部分编译。
-# 关键约束（来自 SConstruct）：
-#   1. arch 只接受 comma_arm64 / aarch64 / x86_64 / Darwin
-#   2. aarch64 且存在 /AGNOS 才走 comma_arm64 分支（-mcpu=cortex-a57）
-#   3. 依赖均为 comma-deps-* 二进制 wheel，必须装到同架构的 Python 里
-# 结论：不能直接在 x86_64 runner 上交叉编出 ARM64；
-#       这里用 QEMU binfmt + arm64 容器在原生 aarch64 环境下编。
+# openpilot/sunnypilot 原生部分编译 (OnePlus 6T / aarch64)
+#
+# 为什么需要 arm64 runner:
+#   SConstruct 只认 comma_arm64/aarch64/x86_64/Darwin, 无交叉编译分支,
+#   依赖 comma-deps-* 是预编译 wheel, 无法在 x86 上重新编译出 arm64。
+#   => 必须跑在原生 aarch64 上。
+#
+# runs-on 二选一:
+#   ubuntu-24.04-arm    GitHub 托管 arm64 (public 仓库免费)
+#   [self-hosted, arm64] 自建 (如 6T 上的 Termux runner)
 
 on:
   workflow_dispatch:
     inputs:
-      target:
-        description: '编译目标: qemu-arm64(跨架构, 产物给 6T) 或 native-x64'
+      runner:
+        description: '运行环境: gh-arm64(托管) 或 self-hosted(自建)'
         required: false
-        default: 'qemu-arm64'
+        default: 'gh-arm64'
       comma_hardware:
-        description: '是否伪装 comma 硬件(创建 /AGNOS, 启用 cortex-a57)'
+        description: '伪装 comma 硬件 (创建 /AGNOS, 启用 cortex-a57 与 camerad)'
         required: false
-        default: 'false'
+        default: 'true'
       scons_jobs:
         description: '并发数'
         required: false
         default: '4'
   push:
-    branches: [master, main, 3xl]
+    branches: [main]
     paths:
-      - 'SConstruct'
-      - 'SConstruct.*'
-      - 'pyproject.toml'
       - '.github/workflows/build-arm64.yml'
 
 permissions:
   contents: write
 
 env:
-  PYTHON_VERSION: '3.12.13'
   UV_VERSION: '0.5.11'
+  SRC_REPO: 'https://jihulab.com/mr-one/openpilot.git'
+  SRC_BRANCH: '3xl'
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    runs-on: ${{ (inputs.runner == 'self-hosted') && fromJSON('["self-hosted","arm64"]') || 'ubuntu-24.04-arm' }}
+    timeout-minutes: 240
 
     steps:
-      - name: Checkout
+      - name: Report runner
+        run: |
+          echo "runner: ${{ inputs.runner || 'gh-arm64' }}"
+          uname -m
+          nproc
+          free -h || true
+
+      - name: Checkout (workflow repo)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
+          clean: true
 
       - name: Fetch source tree
         run: |
           set -euo pipefail
-          # 本仓库只承载 workflow；源码运行时从源站拉取固定 commit
-          git clone --depth 1 --branch 3xl https://jihulab.com/mr-one/openpilot.git src
-          cd src
-          SRC_COMMIT="$(git rev-parse HEAD)"
+          git clone --depth 1 --branch "$SRC_BRANCH" "$SRC_REPO" .src
+          SRC_COMMIT="$(git -C .src rev-parse HEAD)"
           echo "SRC_COMMIT=$SRC_COMMIT" >> "$GITHUB_ENV"
           echo "source commit: $SRC_COMMIT"
-          # 子模块在本仓库被展平为普通目录，源站 clone 后需同步
-          cd "$GITHUB_WORKSPACE"
-          rsync -a --exclude '.git' src/ . || cp -r src/. .
-          rm -rf src
+          # 源码覆盖到工作目录 (保留 .github 里的 workflow)
+          rsync -a --exclude '.git' .src/ ./
+          rm -rf .src
           ls -la | head -20
 
-      - name: Install host tooling
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            qemu-user-static binfmt-support ca-certificates curl file zstd
-
-      - name: Enable QEMU binfmt (aarch64)
-        run: |
-          docker run --privileged --rm tonistiigi/binfmt --install arm64
-          ls /proc/sys/fs/binfmt_misc/ | grep -i aarch64 || true
-
-      - name: Build inside arm64 container
-        if: inputs.target != 'native-x64'
+      - name: Install build deps
         run: |
           set -euo pipefail
-          mkdir -p "$PWD/.build-home"
-          docker run --rm \
-            --platform linux/arm64 \
-            -v "$PWD":"/openpilot" \
-            -w /openpilot \
-            -e CI=1 \
-            -e COMMA_HARDWARE_INPUT="${{ inputs.comma_hardware }}" \
-            -e SCONS_JOBS="${{ inputs.scons_jobs }}" \
-            -e UV_VERSION="${{ env.UV_VERSION }}" \
-            arm64v8/debian:trixie-slim \
-            bash -c '
-              set -euo pipefail
-              apt-get update -qq
-              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-                build-essential clang lld curl ca-certificates git \
-                pkg-config libssl-dev libffi-dev zlib1g-dev \
-                libgles2-mesa-dev libegl1-mesa-dev libdrm-dev \
-                python3 python3-venv python3-dev
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential clang lld pkg-config \
+            libssl-dev libffi-dev zlib1g-dev \
+            libgles2-mesa-dev libegl1-mesa-dev libdrm-dev \
+            python3 python3-venv python3-dev rsync zstd
 
-              # 用 uv 装 uv 管理的 Python 3.12（comma-deps wheel 需匹配解释器）
-              curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
-              export PATH="$HOME/.local/bin:$PATH"
-
-              export UV_PROJECT_ENVIRONMENT=/openpilot/.venv
-              export UV_PYTHON_PREFERENCE=managed
-              # 3.12.13 在 aarch64 无预编译包, 回退 3.12 系列并让 uv 自动选择
-              uv python install 3.12
-              export UV_PYTHON=3.12
-              uv sync --frozen --no-dev --python 3.12
-
-              # comma 硬件分支需要 /AGNOS 存在才会启用 cortex-a57
-              if [ "${COMMA_HARDWARE_INPUT}" = "true" ]; then
-                touch /AGNOS
-                echo "COMMA_HARDWARE=1 (/AGNOS created)"
-              fi
-
-              source .venv/bin/activate
-              python -c "import platform; print(\"python arch:\", platform.machine())"
-              uname -m
-
-              export PYTHONPATH="$PYTHONPATH:/openpilot"
-              scons -j"${SCONS_JOBS}" --minimal 2>&1 | tail -100
-
-              echo "=== artifacts ==="
-              find . -maxdepth 3 -name "*.so" -o -maxdepth 3 -name "*.a" 2>/dev/null | head -50
-            '
-
-      - name: Build native (x86_64, for reference)
-        if: inputs.target == 'native-x64'
+      - name: Setup uv + python
         run: |
           set -euo pipefail
           curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          # 3.12.13 在 aarch64 无预编译包, 用 3.12 系列
+          uv python install 3.12
+          uv python list | head
+
+      - name: Sync dependencies
+        run: |
+          set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
           export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
           export UV_PYTHON_PREFERENCE=managed
-          uv python install 3.12
           export UV_PYTHON=3.12
           uv sync --frozen --no-dev --python 3.12
           source .venv/bin/activate
+          python -c "import platform,sys; print('py:',sys.version.split()[0],'arch:',platform.machine())"
+
+      - name: Enable comma hardware mode
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.comma_hardware }}" = "true" ]; then
+            sudo touch /AGNOS
+            echo "COMMA_HARDWARE=1 (/AGNOS created) -> cortex-a57 + camerad"
+          else
+            echo "COMMA_HARDWARE=0 (generic aarch64)"
+          fi
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          source .venv/bin/activate
           export PYTHONPATH="$PYTHONPATH:$PWD"
-          scons -j"${{ inputs.scons_jobs }}" --minimal 2>&1 | tail -100
+          export CI=1
+          scons -j"${{ inputs.scons_jobs }}" --minimal 2>&1 | tee /tmp/build.log | tail -120
+
+      - name: Smoke test
+        if: success()
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          export PYTHONPATH="$PYTHONPATH:$PWD"
+          echo "=== 产物清单 ==="
+          find . -path ./.git -prune -o -path ./.venv -prune -o \
+            -type f \( -name '*.so' -o -name '*.a' \) -print | head -40
+          echo "=== 关键二进制架构校验 ==="
+          for f in $(find . -maxdepth 4 -type f -name '*.so' | head -5); do
+            file "$f"
+          done
+          echo "=== import 冒烟 ==="
+          python -c "import openpilot.common.params" 2>&1 | head -5 || true
 
       - name: Collect artifacts
         if: always()
         run: |
           set -euo pipefail
           mkdir -p dist
-          # .so/.a 是设备上真正要用的产物
-          find . -path ./.git -prune -o -type f \( -name '*.so' -o -name '*.a' \) -print \
-            | grep -vE '\.venv|site-packages|third_party/(acados|eigen)' \
+          find . -path ./.git -prune -o -path ./.venv -prune -o \
+            -type f \( -name '*.so' -o -name '*.a' -o -name '*.elf' \) -print \
+            | grep -vE 'site-packages|third_party/(acados|eigen)/' \
             | while read -r f; do
-                d="dist/$(dirname "$f")"
-                mkdir -p "$d"
-                cp "$f" "$d/" 2>/dev/null || true
+                d="dist/$(dirname "$f")"; mkdir -p "$d"; cp "$f" "$d/" 2>/dev/null || true
               done
-          echo "=== collected ==="
-          find dist -type f | wc -l
+          echo "files: $(find dist -type f | wc -l)"
           du -sh dist || true
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openpilot-native-${{ inputs.target || 'qemu-arm64' }}
+          name: openpilot-native-${{ inputs.runner || 'gh-arm64' }}-${{ env.SRC_COMMIT }}
           path: dist
           if-no-files-found: warn
           retention-days: 14
@@ -171,8 +163,11 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
-          path: |
-            .sconsign.dblite
+          name: build-log-${{ inputs.runner || 'gh-arm64' }}
+          path: /tmp/build.log
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Cleanup /AGNOS
+        if: always()
+        run: sudo rm -f /AGNOS || true
