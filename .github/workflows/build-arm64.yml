@@ -104,8 +104,10 @@ jobs:
 
               export UV_PROJECT_ENVIRONMENT=/openpilot/.venv
               export UV_PYTHON_PREFERENCE=managed
-              uv python install 3.12.13 || uv python install 3.12
-              uv sync --frozen --no-dev
+              # 3.12.13 在 aarch64 无预编译包, 回退 3.12 系列并让 uv 自动选择
+              uv python install 3.12
+              export UV_PYTHON=3.12
+              uv sync --frozen --no-dev --python 3.12
 
               # comma 硬件分支需要 /AGNOS 存在才会启用 cortex-a57
               if [ "${COMMA_HARDWARE_INPUT}" = "true" ]; then
@@ -132,8 +134,9 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
           export UV_PYTHON_PREFERENCE=managed
-          uv python install 3.12.13 || uv python install 3.12
-          uv sync --frozen --no-dev
+          uv python install 3.12
+          export UV_PYTHON=3.12
+          uv sync --frozen --no-dev --python 3.12
           source .venv/bin/activate
           export PYTHONPATH="$PYTHONPATH:$PWD"
           scons -j"${{ inputs.scons_jobs }}" --minimal 2>&1 | tail -100
