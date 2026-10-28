@@ -68,6 +68,24 @@ jobs:
           # 源码覆盖到工作目录 (保留 .github 里的 workflow)
           rsync -a --exclude '.git' .src/ ./
           rm -rf .src
+
+          # --- 修复源仓库缺失的包目录 ---
+          # tinygrad_repo/pyproject.toml 的 packages 列表里声明了
+          # tinygrad.runtime.support.mlx, 但源仓库未提交该目录, 导致
+          # setuptools.build_meta.build_editable 直接失败。
+          # 补齐为最小可导入占位, 不影响 CPU/QCOM 后端。
+          MLX_DIR="tinygrad_repo/tinygrad/runtime/support/mlx"
+          if [ ! -d "$MLX_DIR" ]; then
+            mkdir -p "$MLX_DIR"
+            printf '%s\n' \
+              '"""Minimal placeholder for the MLX backend package.' \
+              'The upstream tree ships this directory empty; setuptools only' \
+              'requires it to exist to satisfy the declared package list."""' \
+              > "$MLX_DIR/__init__.py"
+            echo "patched: created $MLX_DIR/__init__.py"
+          fi
+          ls -la "$MLX_DIR"
+
           ls -la | head -20
 
       - name: Install build deps
