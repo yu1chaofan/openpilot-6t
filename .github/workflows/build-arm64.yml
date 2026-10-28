@@ -160,6 +160,11 @@ jobs:
           set -euo pipefail
           if [ "${{ inputs.comma_hardware }}" = "true" ]; then
             sudo touch /TICI
+            # SConstruct: cache_dir = '/data/scons_cache' if arch == "larch64"
+            # runner 上 /data 不存在且 / 只读给非 root, 必须先建好并放开权限
+            sudo mkdir -p /data/scons_cache
+            sudo chown -R "$(id -u):$(id -g)" /data
+            echo "scons cache: /data/scons_cache (writable)"
             echo "COMMA_HARDWARE=1 -> arch=larch64, camerad included"
           else
             echo "COMMA_HARDWARE=0 -> generic aarch64 (camerad skipped)"
