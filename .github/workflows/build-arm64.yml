@@ -17,7 +17,7 @@ on:
         required: false
         default: '0.11.1'
       comma_hardware:
-        description: '伪装 comma 硬件 (创建 /AGNOS, 启用 cortex-a57 + camerad)'
+        description: '伪装 comma 硬件 (创建 /TICI, 启用 camerad 与设备专用编译)'
         required: false
         default: 'true'
       scons_jobs:
@@ -102,6 +102,29 @@ jobs:
           done
           ls -la tinygrad_repo/tinygrad/runtime/support/ 2>/dev/null | head || echo "no tinygrad_repo"
 
+      - name: Fetch ONNX models from pre-build branch
+        run: |
+          set -euo pipefail
+          # 0.11.1 发布分支不带 ONNX(为减小体积), 编译 modeld 需要它。
+          # 官方 pre-build 分支保留了全部 ONNX, 直接补齐。
+          MDIR="selfdrive/modeld/models"
+          mkdir -p "$MDIR"
+          miss=0
+          for m in driving_vision.onnx driving_policy.onnx dmonitoring_model.onnx \
+                   big_driving_vision.onnx big_driving_policy.onnx; do
+            if [ -s "$MDIR/$m" ]; then echo "have $m"; continue; fi
+            echo "fetching $m"
+            url="https://raw.githubusercontent.com/dragonpilot/dragonpilot/pre-build/${MDIR}/${m}"
+            if ! curl -fL --retry 5 --retry-delay 3 --retry-all-errors \
+                        --connect-timeout 30 --max-time 900 -o "$MDIR/$m" "$url"; then
+              echo "WARN: failed to fetch $m"; miss=$((miss+1)); rm -f "$MDIR/$m"
+            fi
+          done
+          # big_ 模型是可选的(usbgpu), 缺了不影响主路径
+          echo "=== models ==="
+          ls -la "$MDIR"/*.onnx 2>/dev/null | head -10 || true
+          echo "missing(optional ok): $miss"
+
       - name: Install build deps
         run: |
           set -euo pipefail
@@ -136,10 +159,10 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ inputs.comma_hardware }}" = "true" ]; then
-            sudo touch /AGNOS
-            echo "COMMA_HARDWARE=1 -> -mcpu=cortex-a57, camerad included"
+            sudo touch /TICI
+            echo "COMMA_HARDWARE=1 -> arch=larch64, camerad included"
           else
-            echo "COMMA_HARDWARE=0 -> generic aarch64"
+            echo "COMMA_HARDWARE=0 -> generic aarch64 (camerad skipped)"
           fi
 
       - name: Build
@@ -193,6 +216,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Cleanup /AGNOS
+      - name: Cleanup /TICI
         if: always()
-        run: sudo rm -f /AGNOS || true
+        run: sudo rm -f /TICI || true
