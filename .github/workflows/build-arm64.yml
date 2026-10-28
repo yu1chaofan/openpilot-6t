@@ -1,25 +1,23 @@
 name: build-arm64
 
-# openpilot/sunnypilot 原生部分编译 (OnePlus 6T / aarch64)
+# dragonpilot (openpilot fork) 原生编译 —— OnePlus 6T / aarch64
 #
-# 为什么需要 arm64 runner:
-#   SConstruct 只认 comma_arm64/aarch64/x86_64/Darwin, 无交叉编译分支,
-#   依赖 comma-deps-* 是预编译 wheel, 无法在 x86 上重新编译出 arm64。
-#   => 必须跑在原生 aarch64 上。
+# 为什么必须原生 aarch64:
+#   SConstruct 只认 comma_arm64/aarch64/x86_64/Darwin, 没有交叉编译分支;
+#   依赖 comma-deps-* 是预编译 wheel, 无法在 x86 上重建 arm64。
+#   => 用 GitHub 托管 arm64 runner (public 仓库免费)。
 #
-# runs-on 二选一:
-#   ubuntu-24.04-arm    GitHub 托管 arm64 (public 仓库免费)
-#   [self-hosted, arm64] 自建 (如 6T 上的 Termux runner)
+# 源码来源: dragonpilot/dragonpilot (仓库 ~10GB, 用 archive 下载, 不用 git clone)
 
 on:
   workflow_dispatch:
     inputs:
-      runner:
-        description: '运行环境: gh-arm64(托管) 或 self-hosted(自建)'
+      ref:
+        description: 'dragonpilot 分支/标签'
         required: false
-        default: 'gh-arm64'
+        default: '0.11.1'
       comma_hardware:
-        description: '伪装 comma 硬件 (创建 /AGNOS, 启用 cortex-a57 与 camerad)'
+        description: '伪装 comma 硬件 (创建 /AGNOS, 启用 cortex-a57 + camerad)'
         required: false
         default: 'true'
       scons_jobs:
@@ -36,85 +34,73 @@ permissions:
 
 env:
   UV_VERSION: '0.5.11'
-  SRC_REPO: 'https://jihulab.com/mr-one/openpilot.git'
-  SRC_BRANCH: '3xl'
 
 jobs:
   build:
-    runs-on: ${{ (inputs.runner == 'self-hosted') && fromJSON('["self-hosted","arm64"]') || 'ubuntu-24.04-arm' }}
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 240
 
     steps:
       - name: Report runner
         run: |
-          echo "runner: ${{ inputs.runner || 'gh-arm64' }}"
-          uname -m
-          nproc
-          free -h || true
+          uname -m; nproc; free -h || true
+          df -h / | tail -1
 
-      - name: Checkout (workflow repo)
+      - name: Checkout (workflow only)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           clean: true
 
-      - name: Fetch source tree
+      - name: Fetch dragonpilot source
         run: |
           set -euo pipefail
-          # jihulab 大仓库 clone 经常在中途断流(curl 92 / early EOF),
-          # 用 archive 打包下载替代 git clone, 失败则重试并回退到 clone。
-          fetch_archive() {
-            local url="$1"
-            curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
-                 --connect-timeout 30 --max-time 900 \
-                 -o src.tar.gz "$url" && return 0
-            return 1
-          }
+          REF="${{ inputs.ref || '0.11.1' }}"
+          echo "target ref: $REF"
+          URL="https://github.com/dragonpilot/dragonpilot/archive/refs/heads/${REF}.tar.gz"
 
           ok=0
-          for u in \
-            "https://jihulab.com/mr-one/openpilot/-/archive/${SRC_BRANCH}/openpilot-${SRC_BRANCH}.tar.gz" \
-            "https://jihulab.com/mr-one/openpilot/-/archive/${SRC_BRANCH}/openpilot-${SRC_BRANCH}.zip"; do
-            echo "trying: $u"
-            if fetch_archive "$u"; then ok=1; echo "downloaded $(stat -c%s src.tar.gz) bytes"; break; fi
-            rm -f src.tar.gz
+          for attempt in 1 2 3; do
+            echo "=== attempt $attempt: $URL"
+            if curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
+                    --connect-timeout 30 --max-time 1800 \
+                    -o src.tar.gz "$URL"; then ok=1; break; fi
+            rm -f src.tar.gz; sleep 10
           done
-
-          if [ "$ok" = "1" ]; then
-            mkdir -p .src
-            tar xzf src.tar.gz -C .src --strip-components=1 && rm -f src.tar.gz
-            echo "SRC_COMMIT=$(cat .src/_check_out.txt 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
-          else
-            echo "archive failed, falling back to git clone"
-            git config --global http.postBuffer 524288000
-            git config --global http.version HTTP/1.1
-            git clone --depth 1 --single-branch --branch "$SRC_BRANCH" "$SRC_REPO" .src
-            echo "SRC_COMMIT=$(git -C .src rev-parse HEAD)" >> "$GITHUB_ENV"
+          # heads 失败则试 tags
+          if [ "$ok" != "1" ]; then
+            URL="https://github.com/dragonpilot/dragonpilot/archive/refs/tags/${REF}.tar.gz"
+            echo "=== fallback tags: $URL"
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
+                 --connect-timeout 30 --max-time 1800 -o src.tar.gz "$URL" && ok=1
           fi
-          echo "source: $(cat $GITHUB_ENV | grep SRC_COMMIT)"
+          [ "$ok" = "1" ] || { echo "::error::failed to download source"; exit 1; }
 
-          # 源码覆盖到工作目录 (保留 .github 里的 workflow)
+          echo "downloaded: $(stat -c%s src.tar.gz) bytes"
+          mkdir -p .src
+          tar xzf src.tar.gz -C .src --strip-components=1
+          rm -f src.tar.gz
+          echo "SRC_REF=$REF" >> "$GITHUB_ENV"
+          ls .src | head -20
+
+          # 覆盖到工作目录, 保留 .github/workflows
           rsync -a --exclude '.git' .src/ ./
           rm -rf .src
 
-          # --- 修复源仓库缺失的包目录 ---
-          # tinygrad_repo/pyproject.toml 的 packages 列表里声明了
-          # tinygrad.runtime.support.mlx, 但源仓库未提交该目录, 导致
-          # setuptools.build_meta.build_editable 直接失败。
-          # 补齐为最小可导入占位, 不影响 CPU/QCOM 后端。
-          MLX_DIR="tinygrad_repo/tinygrad/runtime/support/mlx"
-          if [ ! -d "$MLX_DIR" ]; then
-            mkdir -p "$MLX_DIR"
-            printf '%s\n' \
-              '"""Minimal placeholder for the MLX backend package.' \
-              'The upstream tree ships this directory empty; setuptools only' \
-              'requires it to exist to satisfy the declared package list."""' \
-              > "$MLX_DIR/__init__.py"
-            echo "patched: created $MLX_DIR/__init__.py"
-          fi
-          ls -la "$MLX_DIR"
-
-          ls -la | head -20
+      - name: Patch missing tinygrad package dir
+        run: |
+          set -euo pipefail
+          # tinygrad_repo/pyproject.toml 的 packages 声明了
+          # tinygrad.runtime.support.mlx, 但仓库未提交该目录,
+          # setuptools.build_meta.build_editable 会因此直接失败。
+          for d in tinygrad_repo/tinygrad/runtime/support/mlx; do
+            if [ -d "$(dirname "$d")" ] && [ ! -d "$d" ]; then
+              mkdir -p "$d"
+              printf '"""Placeholder for the MLX backend package (not shipped)."""\n' > "$d/__init__.py"
+              echo "patched: $d"
+            fi
+          done
+          ls -la tinygrad_repo/tinygrad/runtime/support/ 2>/dev/null | head || echo "no tinygrad_repo"
 
       - name: Install build deps
         run: |
@@ -132,9 +118,8 @@ jobs:
           curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
-          # 3.12.13 在 aarch64 无预编译包, 用 3.12 系列
           uv python install 3.12
-          uv python list | head
+          uv python list | head -5
 
       - name: Sync dependencies
         run: |
@@ -143,7 +128,7 @@ jobs:
           export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
           export UV_PYTHON_PREFERENCE=managed
           export UV_PYTHON=3.12
-          uv sync --frozen --no-dev --python 3.12
+          uv sync --frozen --no-dev --python 3.12 2>&1 | tail -40
           source .venv/bin/activate
           python -c "import platform,sys; print('py:',sys.version.split()[0],'arch:',platform.machine())"
 
@@ -152,19 +137,18 @@ jobs:
           set -euo pipefail
           if [ "${{ inputs.comma_hardware }}" = "true" ]; then
             sudo touch /AGNOS
-            echo "COMMA_HARDWARE=1 (/AGNOS created) -> cortex-a57 + camerad"
+            echo "COMMA_HARDWARE=1 -> -mcpu=cortex-a57, camerad included"
           else
-            echo "COMMA_HARDWARE=0 (generic aarch64)"
+            echo "COMMA_HARDWARE=0 -> generic aarch64"
           fi
 
       - name: Build
         run: |
           set -euo pipefail
-          export PATH="$HOME/.local/bin:$PATH"
           source .venv/bin/activate
           export PYTHONPATH="${PYTHONPATH:-}:$PWD"
           export CI=1
-          scons -j"${{ inputs.scons_jobs }}" --minimal 2>&1 | tee /tmp/build.log | tail -120
+          scons -j"${{ inputs.scons_jobs }}" --minimal 2>&1 | tee /tmp/build.log | tail -150
 
       - name: Smoke test
         if: success()
@@ -172,15 +156,11 @@ jobs:
           set -euo pipefail
           source .venv/bin/activate
           export PYTHONPATH="${PYTHONPATH:-}:$PWD"
-          echo "=== 产物清单 ==="
+          echo "=== 产物 ==="
           find . -path ./.git -prune -o -path ./.venv -prune -o \
-            -type f \( -name '*.so' -o -name '*.a' \) -print | head -40
-          echo "=== 关键二进制架构校验 ==="
-          for f in $(find . -maxdepth 4 -type f -name '*.so' | head -5); do
-            file "$f"
-          done
-          echo "=== import 冒烟 ==="
-          python -c "import openpilot.common.params" 2>&1 | head -5 || true
+            -type f \( -name '*.so' -o -name '*.a' -o -name '*.elf' \) -print | head -40
+          echo "=== 架构校验 ==="
+          for f in $(find . -maxdepth 4 -type f -name '*.so' | head -5); do file "$f"; done
 
       - name: Collect artifacts
         if: always()
@@ -193,14 +173,13 @@ jobs:
             | while read -r f; do
                 d="dist/$(dirname "$f")"; mkdir -p "$d"; cp "$f" "$d/" 2>/dev/null || true
               done
-          echo "files: $(find dist -type f | wc -l)"
-          du -sh dist || true
+          echo "files: $(find dist -type f | wc -l)"; du -sh dist || true
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openpilot-native-${{ inputs.runner || 'gh-arm64' }}-${{ env.SRC_COMMIT }}
+          name: dragonpilot-arm64-${{ inputs.ref || '0.11.1' }}
           path: dist
           if-no-files-found: warn
           retention-days: 14
@@ -209,7 +188,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-${{ inputs.runner || 'gh-arm64' }}
+          name: build-log
           path: /tmp/build.log
           if-no-files-found: ignore
           retention-days: 7
