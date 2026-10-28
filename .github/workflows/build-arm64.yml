@@ -17,9 +17,9 @@ on:
         required: false
         default: 'pre-build'
       comma_hardware:
-        description: '伪装 comma 硬件 (创建 /TICI, 启用 camerad 与设备专用编译)'
+        description: '伪装 comma 硬件 (创建 /TICI; 需高通相机头, 通用 runner 上会失败)'
         required: false
-        default: 'true'
+        default: 'false'
       scons_jobs:
         description: '并发数'
         required: false
