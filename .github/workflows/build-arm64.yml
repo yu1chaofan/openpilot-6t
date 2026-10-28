@@ -138,7 +138,8 @@ jobs:
             build-essential clang lld pkg-config \
             libssl-dev libffi-dev zlib1g-dev \
             libgles2-mesa-dev libegl1-mesa-dev libdrm-dev \
-            python3 python3-venv python3-dev rsync zstd
+            python3 python3-venv python3-dev rsync zstd \
+            libusb-1.0-0-dev libjpeg-dev libyuv-dev libbz2-dev libcapnp-dev libzmq3-dev
 
       - name: Setup uv + python
         run: |
