@@ -61,10 +61,38 @@ jobs:
       - name: Fetch source tree
         run: |
           set -euo pipefail
-          git clone --depth 1 --branch "$SRC_BRANCH" "$SRC_REPO" .src
-          SRC_COMMIT="$(git -C .src rev-parse HEAD)"
-          echo "SRC_COMMIT=$SRC_COMMIT" >> "$GITHUB_ENV"
-          echo "source commit: $SRC_COMMIT"
+          # jihulab 大仓库 clone 经常在中途断流(curl 92 / early EOF),
+          # 用 archive 打包下载替代 git clone, 失败则重试并回退到 clone。
+          fetch_archive() {
+            local url="$1"
+            curl -fL --retry 5 --retry-delay 5 --retry-all-errors \
+                 --connect-timeout 30 --max-time 900 \
+                 -o src.tar.gz "$url" && return 0
+            return 1
+          }
+
+          ok=0
+          for u in \
+            "https://jihulab.com/mr-one/openpilot/-/archive/${SRC_BRANCH}/openpilot-${SRC_BRANCH}.tar.gz" \
+            "https://jihulab.com/mr-one/openpilot/-/archive/${SRC_BRANCH}/openpilot-${SRC_BRANCH}.zip"; do
+            echo "trying: $u"
+            if fetch_archive "$u"; then ok=1; echo "downloaded $(stat -c%s src.tar.gz) bytes"; break; fi
+            rm -f src.tar.gz
+          done
+
+          if [ "$ok" = "1" ]; then
+            mkdir -p .src
+            tar xzf src.tar.gz -C .src --strip-components=1 && rm -f src.tar.gz
+            echo "SRC_COMMIT=$(cat .src/_check_out.txt 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
+          else
+            echo "archive failed, falling back to git clone"
+            git config --global http.postBuffer 524288000
+            git config --global http.version HTTP/1.1
+            git clone --depth 1 --single-branch --branch "$SRC_BRANCH" "$SRC_REPO" .src
+            echo "SRC_COMMIT=$(git -C .src rev-parse HEAD)" >> "$GITHUB_ENV"
+          fi
+          echo "source: $(cat $GITHUB_ENV | grep SRC_COMMIT)"
+
           # 源码覆盖到工作目录 (保留 .github 里的 workflow)
           rsync -a --exclude '.git' .src/ ./
           rm -rf .src
