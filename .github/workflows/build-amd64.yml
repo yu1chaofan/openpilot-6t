@@ -148,12 +148,15 @@ jobs:
             curl -LsSf "https://astral.sh/uv/'"${UV_VERSION}"'/install.sh" | sh
             export PATH=/root/.local/bin:$PATH
             cd /work
-            uv python pin '"${PYVER}"' || true
-            # 关键: 所有 vendored 依赖 (acados/libyuv/capnproto/eigen/libusb)
-            # 从 commaai/dependencies releases 拉 linux_aarch64 wheel。
-            # uv 会自动按当前 python 的架构 (aarch64) 选 wheel。
+            # 关键决策: 不下载 uv 托管的 CPython。
+            #   pyproject 要求 >=3.12.3,<3.13; chroot 自带 3.12.3 恰好满足;
+            #   uv 托管安装会去下 3.12.13 且强制重建解释器, 在 qemu 下极慢/失败。
+            #   --python-preference only-system 强制用系统 python3.12。
+            #   vendored 依赖 (acados/libyuv/capnproto/eigen/libusb) 的
+            #   linux_aarch64 wheel 由 uv 按解释器架构自动选中。
             export UV_PROJECT_ENVIRONMENT=/work/.venv
-            uv sync --frozen --no-dev 2>&1 | tail -40
+            export UV_PYTHON_PREFERENCE=only-system
+            uv sync --frozen --no-dev --python /usr/bin/python3.12 2>&1 | tail -50
             /work/.venv/bin/python -c "import platform,sys;print(\"py\",sys.version.split()[0],\"arch\",platform.machine())"
             /work/.venv/bin/python -c "import acados,libyuv,capnproto,eigen;print(\"vendored ok\")"
           '
