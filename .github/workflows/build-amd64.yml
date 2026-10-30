@@ -95,7 +95,7 @@ jobs:
               libgles2-mesa-dev libegl1-mesa-dev libdrm-dev \
               python3 python3-venv python3-dev \
               libusb-1.0-0-dev libjpeg-dev libbz2-dev \
-              curl rsync xz-utils zstd
+              curl rsync xz-utils zstd file
             clang --version | head -1
             python3 --version
             arch=$(uname -m); echo "chroot arch=$arch"
@@ -139,6 +139,29 @@ jobs:
             echo "no TICI -> arch aarch64 (camerad skipped)"
           fi
           sudo chroot "$CHROOT" /bin/bash -c 'ls -la /work | head -5; ls /TICI 2>/dev/null && echo TICI-ok'
+
+      - name: Fetch SDM845 camera UAPI headers
+        run: |
+          set -euo pipefail
+          # pre-build 分支把 camera UAPI 头从仓库里删掉了, 改为依赖系统/内核头。
+          # camerad(spectra.cc / camera_qcom2.cc) 需要这些头, 缺一个就 fatal error。
+          # 源头: commaai/agnos-kernel-sdm845 include/uapi/media/
+          KREF="master"
+          KREPO="commaai/agnos-kernel-sdm845"
+          HDIR="$CHROOT/work/system/camerad/include/media"
+          sudo mkdir -p "$HDIR"
+          for h in cam_defs.h cam_req_mgr.h cam_isp.h cam_isp_ife.h cam_icp.h cam_sync.h cam_sensor.h; do
+            url="https://raw.githubusercontent.com/${KREPO}/${KREF}/include/uapi/media/${h}"
+            echo "fetch $h"
+            if ! sudo wget -q --tries=3 --timeout=30 -O "$HDIR/$h" "$url"; then
+              echo "::error::failed to fetch $h"; exit 1
+            fi
+            sudo chmod 644 "$HDIR/$h"
+          done
+          echo "=== headers ==="
+          sudo ls -la "$HDIR"
+          # 同步一个副本到 camerad 根目录的 include/, 兼容不同 include 路径写法
+          sudo cp -a "$HDIR" "$CHROOT/work/system/camerad/include_media_bak" 2>/dev/null || true
 
       - name: Install uv + sync deps (aarch64 wheels)
         run: |
@@ -231,7 +254,20 @@ jobs:
           sudo chroot "$CHROOT" /bin/bash -c 'mkdir -p /out/cereal/gen && cp -a /work/cereal/gen/. /out/cereal/gen/ 2>/dev/null || true'
           sudo cp -a "$CHROOT/out/cereal" "$OUT/" 2>/dev/null || true
           # 3. 依赖清单 (设备端按同样 list 建 venv)
-          sudo chroot "$CHROOT" /bin/bash -c '/work/.venv/bin/python -m pip freeze > /out/requirements-frozen.txt 2>/dev/null || /work/.venv/bin/uv pip freeze > /out/requirements-frozen.txt'
+          # uv 建出来的 venv 不保证有 pip/uv 可执行文件; 用 python -m 更稳,
+          # 最后兜底用系统 uv 的 pip freeze。
+          sudo chroot "$CHROOT" /bin/bash -c '
+            set +e
+            /work/.venv/bin/python -m pip freeze > /out/requirements-frozen.txt 2>/dev/null
+            if [ ! -s /out/requirements-frozen.txt ]; then
+              export PATH=/root/.local/bin:$PATH
+              cd /work && uv pip freeze --python /work/.venv/bin/python > /out/requirements-frozen.txt 2>/dev/null
+            fi
+            if [ ! -s /out/requirements-frozen.txt ]; then
+              /work/.venv/bin/python -c "import json,sys;print(json.dumps(sorted({d.metadata[\"Name\"] for d in __import__(\"importlib.metadata\",fromlist=[\"x\"]).distributions()})))" > /out/requirements-frozen.txt
+            fi
+            wc -l /out/requirements-frozen.txt
+          '
           sudo cp "$CHROOT/out/requirements-frozen.txt" "$OUT/" 2>/dev/null || true
           echo "=== dist 概览 ==="
           find "$OUT" -type f | wc -l
