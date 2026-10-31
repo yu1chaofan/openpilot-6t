@@ -1,0 +1,387 @@
+name: build-amd64-v4
+
+# dragonpilot 原生 aarch64 产物编译 —— 在 amd64 runner 上通过 arm64 rootfs 完成
+#
+# 为什么这样做:
+#   * dragonpilot(pre-build) 的 vendored 依赖 (acados/libyuv/capnproto/eigen/libusb)
+#     在 commaai/dependencies releases 里只有 linux_aarch64 wheel, 没有 arm64 runner
+#     也能用 —— 条件是我们的 python 本体是 aarch64。
+#   * selfdrive/ui/SConscript 只在 arch == "larch64" 且 --extras 时才需要 Qt5/raylib,
+#     本流程用 --minimal, 直接绕开 Qt5 larch64 二进制。
+#   * SConstruct: TICI = os.path.isfile('/TICI') -> aarch64 + /TICI => arch=larch64
+#     => 编出 camerad (sdm845 Titan 170 ISP 路径), 这是 openpilot 上车的关键。
+#
+# 产物策略: 不打包 target/ (数 GB), 只打包"本机编译产生、设备端无法自己生成"的增量:
+#   *.so / *.a / *.elf / camerad / scons 生成的 .capnp 头与源 + venv 的 site-packages 清单
+# 设备端用法见 README-PREBUILT.md (随包产出)。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'dragonpilot 分支 (pre-build = 默认构建分支)'
+        required: false
+        default: 'pre-build'
+      scons_jobs:
+        description: '并发数 (-j)'
+        required: false
+        default: '6'
+      tici:
+        description: '创建 /TICI 标记 (true => arch=larch64, 包含 camerad)'
+        required: false
+        default: 'true'
+      extras:
+        description: '带 extras 构建 (会拉 Qt5/raylib, 容易失败, 默认关)'
+        required: false
+        default: 'false'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-amd64.yml'
+
+permissions:
+  contents: write
+
+env:
+  UV_VERSION: '0.5.11'
+  CHROOT: /opt/arm64
+  PYVER: '3.12'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+
+    steps:
+      - name: Report runner
+        run: |
+          uname -m; nproc; free -h; df -h / | tail -1
+          sudo apt-get update -qq
+
+      - name: Restore rootfs cache
+        id: cache-rootfs
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CHROOT }}
+          key: arm64-rootfs-noble-tuna-v1
+
+      - name: Bootstrap arm64 rootfs (debootstrap, foreign)
+        if: steps.cache-rootfs.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq --no-install-recommends debootstrap qemu-user-static binfmt-support
+          # 用清华 ubuntu-ports 镜像, 比 ports.ubuntu.com 稳定
+          sudo mkdir -p "$CHROOT"
+          sudo debootstrap --arch=arm64 --foreign \
+            --components=main,universe \
+            --include=ca-certificates \
+            noble "$CHROOT" https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports 2>&1 | tail -5
+          sudo cp /usr/bin/qemu-aarch64-static "$CHROOT/usr/bin/" 2>/dev/null || true
+          sudo chroot "$CHROOT" /debootstrap/debootstrap --second-stage 2>&1 | tail -5
+          echo "=== rootfs arch ==="
+          file "$CHROOT/bin/bash" | head -1
+          sudo chroot "$CHROOT" /bin/bash -c 'uname -m; cat /etc/os-release | head -2'
+
+      - name: Prepare chroot (mounts + qemu)
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y -qq --no-install-recommends qemu-user-static binfmt-support 2>/dev/null || true
+          # cache 命中的 rootfs 里可能没有 qemu-static, 补进去
+          if [ ! -e "$CHROOT/usr/bin/qemu-aarch64-static" ]; then
+            sudo cp /usr/bin/qemu-aarch64-static "$CHROOT/usr/bin/" 2>/dev/null || true
+          fi
+          sudo mkdir -p "$CHROOT/proc" "$CHROOT/dev" "$CHROOT/sys" "$CHROOT/data/scons_cache"
+          sudo mount -t proc /proc "$CHROOT/proc" 2>/dev/null || true
+          sudo mount --bind /dev "$CHROOT/dev" 2>/dev/null || true
+          sudo mount --bind /sys "$CHROOT/sys" 2>/dev/null || true
+          echo "=== chroot sanity ==="
+          sudo chroot "$CHROOT" /bin/bash -c 'uname -m' || { echo "::error::chroot broken"; exit 1; }
+
+      - name: Install toolchain inside chroot
+        run: |
+          set -euo pipefail
+          # 已经装了 clang + python3.12 -> cache 命中，跳过 apt（省 12 分钟）
+          if sudo chroot "$CHROOT" /bin/bash -c 'command -v clang >/dev/null && command -v python3.12 >/dev/null && command -v file >/dev/null' 2>/dev/null; then
+            echo "toolchain already present (cache hit) -> skip apt"
+            sudo chroot "$CHROOT" /bin/bash -c 'clang --version | head -1; python3 --version'
+            exit 0
+          fi
+          sudo tee "$CHROOT/etc/apt/sources.list" >/dev/null <<'EOF'
+          deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports noble main restricted universe multiverse
+          deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports noble-updates main restricted universe multiverse
+          deb https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports noble-security main restricted universe multiverse
+          EOF
+          sudo chroot "$CHROOT" /bin/bash -c '
+            set -e
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends \
+              build-essential clang lld pkg-config git ca-certificates \
+              libssl-dev libffi-dev zlib1g-dev \
+              libgles2-mesa-dev libegl1-mesa-dev libdrm-dev \
+              python3 python3-venv python3-dev \
+              libusb-1.0-0-dev libjpeg-dev libbz2-dev \
+              curl rsync xz-utils zstd file
+            clang --version | head -1
+            python3 --version
+            arch=$(uname -m); echo "chroot arch=$arch"
+          '
+
+      - name: Fetch dragonpilot source
+        run: |
+          set -euo pipefail
+          REF="${{ inputs.ref }}"
+          echo "ref: $REF"
+          # 用 blobless archive 下载; pre-build 仓库 ~10GB, archive 约 300MB
+          ok=0
+          for attempt in 1 2 3; do
+            echo "=== attempt $attempt"
+            if timeout 1800 wget -q --tries=3 --timeout=60 \
+                 -O src.tar.gz \
+                 "https://github.com/dragonpilot/dragonpilot/archive/refs/heads/${REF}.tar.gz"; then
+              ok=1; break
+            fi
+            rm -f src.tar.gz; sleep 10
+          done
+          [ "$ok" = "1" ] || { echo "::error::source download failed"; exit 1; }
+          echo "downloaded $(stat -c%s src.tar.gz) bytes"
+          mkdir -p src
+          tar xzf src.tar.gz -C src --strip-components=1
+          rm -f src.tar.gz
+          ls src | head -30
+          echo "SRC_REF=$REF" >> "$GITHUB_ENV"
+
+      - name: Stage source into chroot
+        run: |
+          set -euo pipefail
+          sudo mkdir -p "$CHROOT/work"
+          sudo cp -a src/. "$CHROOT/work/"
+          sudo mkdir -p "$CHROOT/data/scons_cache"
+          # /TICI 必须在 chroot 根上, SConstruct 检查 os.path.isfile('/TICI')
+          if [ "${{ inputs.tici }}" = "true" ]; then
+            sudo touch "$CHROOT/TICI"
+            echo "TICI marker created -> arch will be larch64 (camerad enabled)"
+          else
+            echo "no TICI -> arch aarch64 (camerad skipped)"
+          fi
+          sudo chroot "$CHROOT" /bin/bash -c 'ls -la /work | head -5; ls /TICI 2>/dev/null && echo TICI-ok'
+
+      - name: Fetch SDM845 camera UAPI headers
+        run: |
+          set -euo pipefail
+          # pre-build 分支把 camera UAPI 头从仓库里删掉了, 改为依赖系统/内核头。
+          # camerad(spectra.cc / camera_qcom2.cc) 需要这些头, 缺一个就 fatal error。
+          # 源头: commaai/agnos-kernel-sdm845 include/uapi/media/
+          # !! 关键: SConstruct 的 CPPPATH 只有 ["#", "#msgq", ...],
+          #    "#" = 仓库根 => #include "media/cam_defs.h" 解析为 <root>/media/cam_defs.h
+          #    pre-build 的 system/camerad/SConscript 没有追加 include 路径,
+          #    所以头必须放在 <root>/media/, 不能放 system/camerad/include/media/。
+          KREF="master"
+          KREPO="commaai/agnos-kernel-sdm845"
+          HDIR="$CHROOT/work/media"
+          sudo mkdir -p "$HDIR"
+
+          # 拉全 29 个头: cam_*.h 之间互相 include (cam_defs->cam_cpas, cam_isp->cam_defs ...),
+          # 只拉 7 个会在编译期二次失败。
+          HEADERS="cam_cpas.h cam_defs.h cam_fd.h cam_icp.h cam_isp.h cam_isp_ife.h cam_isp_vfe.h cam_jpeg.h cam_lrme.h cam_req_mgr.h cam_sensor.h cam_sync.h msm_cam_sensor.h msm_camera.h msm_camsensor_sdk.h msm_fd.h msm_isp.h msm_jpeg.h msm_jpeg_dma.h msm_media_info.h msm_sde_rotator.h msm_vidc.h msmb_camera.h msmb_generic_buf_mgr.h msmb_isp.h msmb_ispif.h msmb_pproc.h radio-iris-commands.h radio-iris.h"
+
+          fail=0
+          for h in $HEADERS; do
+            url="https://raw.githubusercontent.com/${KREPO}/${KREF}/include/uapi/media/${h}"
+            if sudo wget -q --tries=3 --timeout=30 -O "$HDIR/$h" "$url"; then
+              sudo chmod 644 "$HDIR/$h"
+            else
+              echo "WARN: $h not fetched"; fail=$((fail+1)); sudo rm -f "$HDIR/$h"
+            fi
+          done
+          echo "=== headers in $HDIR ==="
+          sudo ls -la "$HDIR" | tail -35
+          n=$(sudo ls -1 "$HDIR" | wc -l)
+          echo "fetched $n headers (missing/warn: $fail)"
+          [ "$n" -ge 20 ] || { echo "::error::too few headers ($n)"; exit 1; }
+          # 自检: 编译器能找到 media/cam_defs.h
+          if ! sudo chroot "$CHROOT" /bin/bash -c 'echo "#include <media/cam_defs.h>" | clang -E -x c++ - -I/work >/dev/null 2>&1'; then
+            echo "::error::clang cannot resolve media/cam_defs.h via -I/work"
+            exit 1
+          fi
+          echo "header include check: OK"
+
+      - name: Restore venv cache
+        id: cache-venv
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /opt/arm64/work/.venv
+            /opt/arm64/root/.local/bin
+          key: dp-venv-${{ inputs.ref }}-${{ hashFiles('**/uv.lock') }}-v1
+
+      - name: Install uv + sync deps (aarch64 wheels)
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo chroot "$CHROOT" /bin/bash -c '
+            set -e
+            curl -LsSf "https://astral.sh/uv/'"${UV_VERSION}"'/install.sh" | sh
+            export PATH=/root/.local/bin:$PATH
+            cd /work
+            # 关键决策: 不下载 uv 托管的 CPython。
+            #   pyproject 要求 >=3.12.3,<3.13; chroot 自带 3.12.3 恰好满足;
+            #   uv 托管安装会去下 3.12.13 且强制重建解释器, 在 qemu 下极慢/失败。
+            #   --python-preference only-system 强制用系统 python3.12。
+            #   vendored 依赖 (acados/libyuv/capnproto/eigen/libusb) 的
+            #   linux_aarch64 wheel 由 uv 按解释器架构自动选中。
+            export UV_PROJECT_ENVIRONMENT=/work/.venv
+            export UV_PYTHON_PREFERENCE=only-system
+            uv sync --frozen --no-dev --python /usr/bin/python3.12 2>&1 | tail -50
+            /work/.venv/bin/python -c "import platform,sys;print(\"py\",sys.version.split()[0],\"arch\",platform.machine())"
+            /work/.venv/bin/python -c "import acados,libyuv,capnproto,eigen;print(\"vendored ok\")"
+          '
+
+      - name: Save venv cache
+        if: steps.cache-venv.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /opt/arm64/work/.venv
+            /opt/arm64/root/.local/bin
+          key: dp-venv-${{ inputs.ref }}-${{ hashFiles('**/uv.lock') }}-v1
+
+      - name: Patch tinygrad package dir
+        run: |
+          set -euo pipefail
+          sudo chroot "$CHROOT" /bin/bash -c '
+            set -e
+            cd /work
+            for d in tinygrad_repo/tinygrad/runtime/support/mlx; do
+              if [ -d "$(dirname $d)" ] && [ ! -d "$d" ]; then
+                mkdir -p "$d"; echo "\"\"\"placeholder\"\"\"" > "$d/__init__.py"; echo "patched $d"
+              fi
+            done
+          '
+
+      - name: Restore scons cache
+        id: cache-scons
+        uses: actions/cache/restore@v4
+        with:
+          path: /opt/arm64/data/scons_cache
+          key: dp-scons-${{ inputs.ref }}-${{ inputs.tici }}-v3
+          restore-keys: |
+            dp-scons-${{ inputs.ref }}-${{ inputs.tici }}-v3
+            dp-scons-${{ inputs.ref }}-
+
+      - name: Build (scons, minimal)
+        run: |
+          set -euo pipefail
+          sudo chroot "$CHROOT" /bin/bash -c '
+            set -e
+            export PATH=/root/.local/bin:$PATH
+            cd /work
+            source .venv/bin/activate
+            export PYTHONPATH=/work:$PYTHONPATH
+            export CI=1
+            echo "=== arch check ==="
+            python -c "import os;print(\"TICI:\", os.path.isfile(\"/TICI\"))"
+            scons -j${{ inputs.scons_jobs }} --minimal '"$( [ "${{ inputs.extras }}" = "true" ] && echo "--extras" || echo "" )"' 2>&1 | tee /tmp/build.log | tail -200
+          '
+
+      - name: Save scons cache
+        if: always()
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: /opt/arm64/data/scons_cache
+          # rolling key: 每次 run 唯一, 但 restore-keys 前缀 dp-scons-<ref>-<tici>-v2
+          # 会匹配到最近一次的缓存 (含失败 run 的部分成果)。
+          key: dp-scons-${{ inputs.ref }}-${{ inputs.tici }}-v3-r${{ github.run_number }}
+
+      - name: Verify camerad built for aarch64
+        run: |
+          set -euo pipefail
+          # 注意: 绝不能用 `ls x || echo "missing"` —— 那会让 set -e 失效, 造成假绿。
+          sudo chroot "$CHROOT" /bin/bash -c '
+            set -e
+            cd /work
+            echo "=== 关键产物 ==="
+            MISSING=0
+            for f in system/camerad/camerad selfdrive/pandad/pandad; do
+              if [ -f "$f" ]; then
+                printf "OK   "; ls -la "$f"; file "$f"
+              else
+                echo "MISSING: $f"; MISSING=$((MISSING+1))
+              fi
+            done
+            echo "=== so 数量 ==="
+            find . -path ./.venv -prune -o -name "*.so" -print 2>/dev/null | wc -l
+            if [ "$MISSING" -gt 0 ]; then
+              echo "::error::$MISSING critical binary/binaries missing"; exit 1
+            fi
+          '
+
+      - name: Package installable tree
+        if: success()
+        run: |
+          set -euo pipefail
+          OUT=dist
+          # 打包前硬断言: camerad 必须存在, 否则产物不可用
+          sudo chroot "$CHROOT" /bin/bash -c 'test -x /work/system/camerad/camerad' \
+            || { echo "::error::camerad missing, refusing to package"; exit 1; }
+          rm -rf "$OUT"; mkdir -p "$OUT"
+          # 1. 编译产物 (设备端无法自建): 可执行文件 / .so / .a / .elf
+          sudo chroot "$CHROOT" /bin/bash -c '
+            cd /work
+            mkdir -p /out
+            find . -path ./.venv -prune -o -path ./.git -prune -o \
+              -type f \( -name "*.so" -o -name "*.a" -o -name "*.elf" \) -print \
+              | grep -vE "site-packages|third_party/(acados|eigen)/" \
+              | while read -r f; do d="/out/$(dirname "$f")"; mkdir -p "$d"; cp -p "$f" "$d/"; done
+            # 可执行程序 (scons Program 的产物: ELF + 可执行权限, 无扩展名)
+            for f in $(find . -path ./.venv -prune -o -path ./.git -prune -o \
+                        -type f -perm -u+x ! -name "*.sh" ! -name "*.py" \
+                        ! -name "*.cc" ! -name "*.h" ! -name "*.c" ! -name "*.md" -print 2>/dev/null); do
+              if file "$f" | grep -q "ELF"; then d="/out/$(dirname "$f")"; mkdir -p "$d"; cp -p "$f" "$d/"; fi
+            done
+          '
+          sudo cp -a "$CHROOT/out/." "$OUT/"
+          # 2. capnp 生成物 (编译期产物, 设备端有 capnp 也能生成, 但省时间)
+          sudo chroot "$CHROOT" /bin/bash -c 'mkdir -p /out/cereal/gen && cp -a /work/cereal/gen/. /out/cereal/gen/ 2>/dev/null || true'
+          sudo cp -a "$CHROOT/out/cereal" "$OUT/" 2>/dev/null || true
+          # 3. 依赖清单 (设备端按同样 list 建 venv)
+          # uv 建出来的 venv 不保证有 pip/uv 可执行文件; 用 python -m 更稳,
+          # 最后兜底用系统 uv 的 pip freeze。
+          sudo chroot "$CHROOT" /bin/bash -c '
+            set +e
+            /work/.venv/bin/python -m pip freeze > /out/requirements-frozen.txt 2>/dev/null
+            if [ ! -s /out/requirements-frozen.txt ]; then
+              export PATH=/root/.local/bin:$PATH
+              cd /work && uv pip freeze --python /work/.venv/bin/python > /out/requirements-frozen.txt 2>/dev/null
+            fi
+            if [ ! -s /out/requirements-frozen.txt ]; then
+              /work/.venv/bin/python -c "import json,sys;print(json.dumps(sorted({d.metadata[\"Name\"] for d in __import__(\"importlib.metadata\",fromlist=[\"x\"]).distributions()})))" > /out/requirements-frozen.txt
+            fi
+            wc -l /out/requirements-frozen.txt
+          '
+          sudo cp "$CHROOT/out/requirements-frozen.txt" "$OUT/" 2>/dev/null || true
+          echo "=== dist 概览 ==="
+          find "$OUT" -type f | wc -l
+          du -sh "$OUT"
+          tar -C "$OUT" -cZf "dragonpilot-larch64-${SRC_REF}.tar.zst" . 2>/dev/null || tar -C "$OUT" -czf "dragonpilot-larch64-${SRC_REF}.tar.gz" .
+          ls -la dragonpilot-larch64-*.tar.* || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dragonpilot-larch64-${{ inputs.ref }}-${{ github.run_number }}
+          path: |
+            dist
+            dragonpilot-larch64-*.tar.*
+            /tmp/build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Cleanup mounts
+        if: always()
+        run: |
+          sudo umount -l "$CHROOT/sys" 2>/dev/null || true
+          sudo umount -l "$CHROOT/dev" 2>/dev/null || true
+          sudo umount -l "$CHROOT/proc" 2>/dev/null || true
